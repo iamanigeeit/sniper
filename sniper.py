@@ -99,8 +99,12 @@ class SniperTraining:
             optim_lr:
                 Default optimizer learning rate.
             track_all_params_lr:
-                Whether or not to track the learning rate for all parameters if `scale_lr_by_param` is True. This module
-                does not use it directly, but you may want to report the LRs in Tensorboard.
+                Whether or not to track the learning rate for all parameters if `scale_lr_by_param` is `True`.
+                If `track_all_params_lr` is `True`, then `self.track_pg_index` stays at -1.
+                If False, `self.track_pg_index` is set to the first `param_group` that maintains the original LR.
+                Although this module does not use `self.track_pg_index`, you may want to report the LRs in Tensorboard,
+                and `self.track_pg_index` can be used to either report learning rate for ALL parameters or just the
+                current overall LR.
 
         Returns:
 
@@ -124,6 +128,9 @@ class SniperTraining:
         self.resume = resume
         self.optim_lr = optim_lr
         self.track_all_params_lr = track_all_params_lr
+
+        # self.grad_scaling = 100.0 / (100 - start_sparsity)
+        # self.logger.info(f'Gradient scaling is {self.grad_scaling}...')
 
         self.module_to_snip = get_module_to_snip(model, snip_module_name)
 
@@ -187,7 +194,7 @@ class SniperTraining:
                 # log_nonzeros_count(self.module_to_snip, self.logger)
 
                 param_groups = []  # full_name: {'name': str, 'params': [Tensor], 'lr': float}
-                self.logger.info('Creating optimizer learning rates')
+                self.logger.info('Creating optimizer learning rates...')
 
                 cutoff = len(self.snip_module_name) + 1 if self.snip_module_name else 0
                 for model_full_name, param in model.named_parameters():
@@ -257,10 +264,11 @@ class SniperTraining:
             self.forward_hook = None
 
     def update_lrs(self):
-        if self.optimizers is not None and self.schedulers is not None:
-            self.logger.info('Setting optimizer and scheduler learning rates')
+        if self.optimizers is not None:
+            self.logger.info('Setting new learning rates')
             cutoff = len(self.snip_module_name) + 1 if self.snip_module_name else 0
-            for optim, scheduler in zip(self.optimizers, self.schedulers):
+            for i, optim in enumerate(self.optimizers):
+                new_lrs = []
                 for param_group in optim.param_groups:
                     model_full_name = param_group['name']
                     full_name = model_full_name[cutoff:]
@@ -269,16 +277,29 @@ class SniperTraining:
                         density = mask.sum().item() / torch.numel(mask)
                         if density:
                             new_lr = self.optim_lr * min(1.0 / density, self.max_lr_scaling)
-                            param_group['lr'] = new_lr
-                scheduler.base_lrs = [group['lr'] for group in optim.param_groups]
+                            new_lrs.append(new_lr)
+                        else:
+                            new_lrs.append(self.optim_lr)
+                    else:
+                        new_lrs.append(self.optim_lr)
+                if self.schedulers is None:  # learning rate completely controlled by sniper
+                    for new_lr, param_group in zip(new_lrs, optim.param_groups):
+                        param_group['lr'] = new_lr
+                else:  # learning rate controlled by scheduler; update scheduler.base_lrs
+                    scheduler = self.schedulers[i]
+                    scheduler.base_lrs = new_lrs
+                    # self.logger.info('\n'.join([f'{group["name"]} {group["lr"]}' for group in optim.param_groups]))
 
     def reset_lrs(self):
-        if self.optimizers is not None and self.schedulers is not None:
-            self.logger.info('Restoring original optimizer and scheduler learning rates')
-            for optim, scheduler in zip(self.optimizers, self.schedulers):
-                for param_group in optim.param_groups:
-                    param_group['lr'] = self.optim_lr
-                scheduler.base_lrs = [self.optim_lr] * len(optim.param_groups)
+        if self.optimizers is not None:
+            self.logger.info('Restoring original learning rates')
+            for i, optim in enumerate(self.optimizers):
+                if self.schedulers is None:
+                    for param_group in optim.param_groups:
+                        param_group['lr'] = self.optim_lr
+                else:
+                    scheduler = self.schedulers[i]
+                    scheduler.base_lrs = [self.optim_lr] * len(optim.param_groups)
 
     def create_masks(self, sparsity: float, total_grads: Dict[str, torch.Tensor], max_param_sparsity: float = 100.0):
         flattened_grads = torch.cat([total_grad.view(-1) for total_grad in total_grads.values()])
@@ -398,6 +419,7 @@ class SniperTraining:
                 if exclude_param in full_name:
                     del masks[full_name]
                     break
+        self.logger.info(f'Loaded mask from {masks_path}')
         return masks
 
 
