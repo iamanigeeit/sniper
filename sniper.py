@@ -36,7 +36,7 @@ class SniperTraining:
         self.track_all_params_lr = False
 
         # Training state
-        self.epoch = 0
+        self.epoch = None
         self.current_sparsity = 0
         self.current_masks = None
         self.log_sparsity = False
@@ -115,6 +115,7 @@ class SniperTraining:
             assert len(schedule) == 1
         self.schedule = schedule
         start_sparsity = schedule[0]
+        self.epoch = 0
         self.current_sparsity = start_sparsity
         self.model_builder = model_builder
         self.snip_module_name = snip_module_name
