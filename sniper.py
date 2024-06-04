@@ -1,4 +1,5 @@
 import random
+import warnings
 from pathlib import Path
 import dataclasses
 import numpy as np
@@ -6,9 +7,20 @@ import collections
 import os
 import time
 import logging
-from functools import reduce
-from typing import Dict, Callable, Iterable
+from functools import reduce, partial
+from typing import Dict, Callable, Iterable, List
 import torch
+from torch.optim.lr_scheduler import LambdaLR, CyclicLR, CosineAnnealingWarmRestarts, OneCycleLR
+
+# Most schedulers depend on the previous LR value, thus we only need to change the LR
+# whenever we have a new sparsity, and the rest will follow.
+# Such schedulers refer to group['lr'] in their get_lr() function
+
+# For these schedulers, LR values do not depend on the previous LR value.
+# If we scale the learning rate, we have to monkey-patch scheduler.step to ensure our scaling is applied.
+# Ideally we want to either chain the scheduler with MultiplicativeLR, but not all
+# schedulers are chainable and not all schedulers use base_lrs either.
+CLOSED_FORM_LR_SCHEDULERS = [LambdaLR, CyclicLR, CosineAnnealingWarmRestarts, OneCycleLR]
 
 
 class SniperTraining:
@@ -26,45 +38,57 @@ class SniperTraining:
         self.snip_module_name = ''
         self.batch_iterator = None
         self.get_loss_fn = None
-        self.max_lr_scaling = 10.0
+        self.forward_mask = True
+        self.scale_lr = True
+        self.scale_lr_by_param = False
+        self.max_lr_scaling = 2.0
         self.max_param_sparsity = 100.0
         self.exclude_params = None
-        self.restore_init_values = False
+        self.restore_init_values = True
         self.train_dtype = None
-        self.resume = False
-        self.optim_lr = 1.0
+        self.resume_epoch = 0
+        self.optim_lrs = None
         self.track_all_params_lr = False
 
         # Training state
-        self.epoch = None
+        self.epoch = 0
+        self.init_values = None
         self.current_sparsity = 0
         self.current_masks = None
         self.log_sparsity = False
         self.module_to_snip = None
         self.forward_hook = None
-        self.param_groups = None
-        self.track_pg_index = -1
-        self.optimizers = None
-        self.schedulers = None
+        self.track_pg_indices = None
+        self.optimizers = []
+        self.schedulers = []
+        self.step_fns = []
+        self.update_step_fns = []
+        self.lr_factor = 1.0
+        self.optim_lr_factors = []
 
 
-    def train(self,
-              schedule: Dict[int, float],
-              model: torch.nn.Module,
-              model_builder: Callable,
-              snip_module_name: str,
-              batch_iterator: Iterable,
-              get_loss_fn: Callable,
-              scale_lr_by_param: bool = True,
-              max_lr_scaling: float = 10.0,
-              max_param_sparsity: float = 100.0,
-              exclude_params: Iterable[str] = ('embed', 'norm',),
-              restore_init_values: bool = True,
-              train_dtype=torch.float32,
-              resume=False,
-              optim_lr=1.0,
-              track_all_params_lr=False,
-              ):
+    def train(
+            self,
+            schedule: Dict[int, float],
+            model: torch.nn.Module,
+            model_builder: Callable,
+            snip_module_name: str,
+            batch_iterator: Iterable,
+            get_loss_fn: Callable,
+            optimizers: List[torch.optim.Optimizer],
+            schedulers: List[torch.optim.lr_scheduler.LRScheduler] = [],
+            forward_mask : bool = True,
+            scale_lr : bool = False,
+            scale_lr_by_param: bool = True,
+            max_lr_scaling: float = 100.0,
+            max_param_sparsity: float = 100.0,
+            exclude_params: Iterable[str] = ('embed', 'norm',),
+            restore_init_values: bool = True,
+            train_dtype: torch.dtype = torch.float32,
+            resume_epoch: int = 0,
+            optim_lrs: Iterable[float] = (1.0,),
+            track_all_params_lr=False,
+    ):
         """
 
         Args:
@@ -73,7 +97,8 @@ class SniperTraining:
             model:
                 The model to be trained and pruned
             model_builder:
-                When called, should return an exact copy of model (needed to compute gradients repeatedly)
+                When called, should return an exact copy of model (needed to compute gradients repeatedly).
+                If the model_builder requires some arguments, use functools.partial(model_builder_fn, args)
             snip_module_name:
                 Submodule to prune (example: "tts.encoder"). Use empty string to prune whole model.
             batch_iterator:
@@ -81,7 +106,7 @@ class SniperTraining:
             get_loss_fn:
                 When `get_loss_fn(model, batch)` is called, should return a differentiable loss function.
             scale_lr_by_param:
-                Whether or not to scale learning rate according to each parameter's sparsity. Otherwise, `optim_lr`
+                Whether or not to scale each parameter's learning rate according to its sparsity. Otherwise, `optim_lr`
                 will be used.
             max_lr_scaling:
                 When using per-parameter learning rate, sets a maximum LR to prevent gradient explosion.
@@ -100,7 +125,7 @@ class SniperTraining:
                 Default optimizer learning rate.
             track_all_params_lr:
                 Whether or not to track the learning rate for all parameters if `scale_lr_by_param` is `True`.
-                If `track_all_params_lr` is `True`, then `self.track_pg_index` stays at -1.
+                If `track_all_params_lr` is `True`, then `self.track_pg_index` stays at 0.
                 If False, `self.track_pg_index` is set to the first `param_group` that maintains the original LR.
                 Although this module does not use `self.track_pg_index`, you may want to report the LRs in Tensorboard,
                 and `self.track_pg_index` can be used to either report learning rate for ALL parameters or just the
@@ -111,23 +136,26 @@ class SniperTraining:
         """
 
         assert 0 in schedule
-        if schedule[0] == 0:
-            assert len(schedule) == 1
         self.schedule = schedule
         start_sparsity = schedule[0]
-        self.epoch = 0
         self.current_sparsity = start_sparsity
         self.model_builder = model_builder
         self.snip_module_name = snip_module_name
         self.batch_iterator = batch_iterator
         self.get_loss_fn = get_loss_fn
+        self.optimizers = optimizers
+        self.schedulers = schedulers
+        self.step_fns = [scheduler.step for scheduler in schedulers]
+        self.forward_mask = forward_mask
+        self.scale_lr = scale_lr
+        self.scale_lr_by_param = scale_lr_by_param
         self.max_lr_scaling = max_lr_scaling
         self.max_param_sparsity = max_param_sparsity
         self.exclude_params = exclude_params
         self.restore_init_values = restore_init_values
         self.train_dtype = train_dtype
-        self.resume = resume
-        self.optim_lr = optim_lr
+        self.resume_epoch = resume_epoch
+        self.optim_lrs = optim_lrs
         self.track_all_params_lr = track_all_params_lr
 
         # self.grad_scaling = 100.0 / (100 - start_sparsity)
@@ -144,12 +172,13 @@ class SniperTraining:
         if init_values_path.exists():
             self.logger.info(f'Loading initial model state from {init_values_path}')
             init_values = torch.load(init_values_path, map_location=self.device)
-            if not resume:
+            if not resume_epoch:
                 model.load_state_dict(init_values)
         else:
             self.logger.info(f'Saving initial model state to {init_values_path}')
             init_values = model.state_dict()
             torch.save(init_values, init_values_path)
+        self.init_values = init_values
 
         sparsities = sorted(schedule.values())
         missing_sparsities = {}
@@ -179,63 +208,86 @@ class SniperTraining:
 
             del total_grads
 
-        if start_sparsity:
-            param_groups = []
-            if resume or not scale_lr_by_param:
-                for model_full_name, param in model.named_parameters():
-                    param_groups.append({'name': model_full_name, 'params': [param], 'lr': optim_lr})
-            else:
-                self.logger.info(f'All required sparsities present, loading sparsity {start_sparsity}...')
-                start_masks = self.load_masks(start_sparsity)
-                self.current_masks = start_masks
+        self.logger.info(f'All required sparsities present')
 
-                self.logger.info(f'Adding mask operation to forward hook...')
-                self.forward_hook = self.module_to_snip.register_forward_pre_hook(hook=get_forward_hook(start_masks))
-                # self.forward_hooks = register_masks(module_to_snip, start_masks)
-                # log_nonzeros_count(self.module_to_snip, self.logger)
-
-                param_groups = []  # full_name: {'name': str, 'params': [Tensor], 'lr': float}
-                self.logger.info('Creating optimizer learning rates...')
-
-                cutoff = len(self.snip_module_name) + 1 if self.snip_module_name else 0
-                for model_full_name, param in model.named_parameters():
-                    if model_full_name.startswith(self.snip_module_name):
-                        full_name = model_full_name[cutoff:]
-                        if full_name in start_masks:
-                            mask = start_masks[full_name]
-                            density = mask.sum().item() / torch.numel(mask)
-                            if density:
-                                lr = optim_lr * min(1.0 / density, max_lr_scaling)
-                            else:
-                                lr = optim_lr
-                        else:
-                            lr = optim_lr
-                    else:
-                        lr = optim_lr
-                    param_groups.append({'name': model_full_name, 'params': [param], 'lr': lr})
-            self.param_groups = param_groups
-
-            if not track_all_params_lr:
-                for i, pg in enumerate(param_groups):
+        pg_indices = [-1] * len(optimizers)
+        if not track_all_params_lr:
+            # If there are too many params, just report optim_lr / last lr and not every param's lr
+            for i, (optimizer, optim_lr) in enumerate(zip(optimizers, optim_lrs)):
+                for pg_index, pg in enumerate(optimizer.param_groups):
                     if pg['lr'] == optim_lr:
-                        self.track_pg_index = i
+                        pg_indices[i] = pg_index
                         break
+        self.track_pg_indices = pg_indices
+
+        self.update_step_fns = [False] * len(schedulers)
+        if scale_lr_by_param:
+            self.optim_lr_factors = [[1.0 for _ in optimizer.param_groups] for optimizer in optimizers]
+        for i, scheduler in enumerate(schedulers):
+            for closed_form_scheduler in CLOSED_FORM_LR_SCHEDULERS:
+                if isinstance(scheduler, closed_form_scheduler):
+                    self.update_step_fns[i] = True
+                    break
+
+
+        if start_sparsity:
+            assert optimizers, 'optimizers must have at least one optimizer'
+            if resume_epoch:
+                self.resume_from(resume_epoch, optimizers, schedulers)
+            else:
+                self.logger.info(f'Loading sparsity {start_sparsity}...')
+                self.current_masks = self.load_masks(start_sparsity)
+
+                self.update_lrs(start_sparsity)
+
+                if forward_mask:
+                    self.logger.info(f'Adding mask operation to forward hook...')
+                    self.forward_hook = self.module_to_snip.register_forward_pre_hook(
+                        hook=get_forward_hook(self.current_masks)
+                    )
+                    # self.forward_hooks = register_masks(module_to_snip, self.current_masks)
+                    # log_nonzeros_count(self.module_to_snip, self.logger)
+
+
+            #     param_groups = []  # param_group = {'name': str, 'params': [Tensor], 'lr': float}
+            #     self.logger.info('Creating optimizer learning rates...')
+            #
+            #     cutoff = len(self.snip_module_name) + 1 if self.snip_module_name else 0
+            #     for model_full_name, param in model.named_parameters():
+            #         lr = optim_lr
+            #         if model_full_name.startswith(self.snip_module_name):
+            #             full_name = model_full_name[cutoff:]
+            #             if full_name in start_masks:
+            #                 mask = start_masks[full_name]
+            #                 if scale_lr_by_param:
+            #                     density = mask.sum().item() / torch.numel(mask)
+            #                     if density:
+            #                         lr = optim_lr * min(1.0 / density, max_lr_scaling)
+            #         param_groups.append({'name': model_full_name, 'params': [param], 'lr': lr})
+            # # Use these param_groups to create optimizers with named param_groups!
+            # self.param_groups = param_groups
+
+
 
     def step(self):
         self.epoch += 1
         if self.epoch in self.schedule:
             new_sparsity = self.schedule[self.epoch]
-            self.update_hooks(new_sparsity)
+            self.current_sparsity = new_sparsity
             if new_sparsity:
-                self.update_lrs()
+                self.logger.info(f'New sparsity scheduled: {new_sparsity} -- replacing with new mask')
+                self.current_masks = self.load_masks(new_sparsity)
+                self.update_lrs(new_sparsity)
             else:
+                self.logger.info(f'New sparsity is 0 -- removing mask')
+                self.current_masks = None
                 self.reset_lrs()
+            if self.forward_mask:
+                self.update_hooks(new_sparsity)
             if self.restore_init_values:
                 self.restore_init()
             else:
-                self.log_sparsity = True
-        if self.log_sparsity:
-            self.log_nonzeros_count()
+                self.log_nonzeros_count()
 
     def resume_from(self, epoch, optimizers, schedulers):
         self.epoch = epoch
@@ -247,60 +299,98 @@ class SniperTraining:
         # No need to update learning rates here as they should be loaded when resuming checkpoint
 
     def update_hooks(self, new_sparsity):
-        self.current_sparsity = new_sparsity
         if self.forward_hook is not None:
+            self.logger.info('Removing forward hook')
             self.forward_hook.remove()
             # for forward_hook in self.forward_hooks:
             #     forward_hook.remove()
         if new_sparsity:
-            self.logger.info(f'New sparsity scheduled: {new_sparsity} -- replacing with new mask')
-            new_masks = self.load_masks(new_sparsity)
-            self.current_masks = new_masks
-            self.forward_hook = self.module_to_snip.register_forward_pre_hook(hook=get_forward_hook(new_masks))
-            # update_masks(self.module_to_snip, new_masks)
-
+            self.logger.info('Adding new forward hook')
+            self.forward_hook = self.module_to_snip.register_forward_pre_hook(
+                hook=get_forward_hook(self.current_masks)
+            )
+            # update_masks(self.module_to_snip, self.current_masks)
         else:
-            self.logger.info(f'New sparsity is 0 -- removing mask')
-            self.current_masks = None
             self.forward_hook = None
 
-    def update_lrs(self):
-        if self.optimizers is not None:
-            self.logger.info('Setting new learning rates')
+    def update_lrs(self, new_sparsity):
+        if not self.scale_lr and not self.scale_lr_by_param:
+            return
+
+        self.logger.info('Setting new learning rates')
+        new_lr_factor = 1.0
+        if self.scale_lr:
+            new_lr_factor = self.scaling_fn(new_sparsity / 100.)
+        if self.scale_lr_by_param:
+            optim_lr_factors = []
             cutoff = len(self.snip_module_name) + 1 if self.snip_module_name else 0
             for i, optim in enumerate(self.optimizers):
-                new_lrs = []
-                for param_group in optim.param_groups:
-                    model_full_name = param_group['name']
-                    full_name = model_full_name[cutoff:]
-                    if full_name in self.current_masks:
-                        mask = self.current_masks[full_name]
-                        density = mask.sum().item() / torch.numel(mask)
-                        if density:
-                            new_lr = self.optim_lr * min(1.0 / density, self.max_lr_scaling)
-                            new_lrs.append(new_lr)
-                        else:
-                            new_lrs.append(self.optim_lr)
+                new_lr_factors = [new_lr_factor] * len(optim.param_groups)
+                if self.scale_lr_by_param:
+                    for i, param_group in enumerate(optim.param_groups):
+                        model_full_name = param_group['name']
+                        full_name = model_full_name[cutoff:]
+                        if full_name in self.current_masks:
+                            mask = self.current_masks[full_name]
+                            density = mask.sum().item() / torch.numel(mask)
+                            if density:
+                                new_lr_factors[i] = self.scaling_fn(1-density)
+                optim_lr_factors.append(new_lr_factors)
+
+        if self.scale_lr_by_param:
+            if self.schedulers:
+                for update, old_lr_factors, new_lr_factors, optimizer, scheduler in zip(
+                        self.update_step_fns, self.optim_lr_factors, optim_lr_factors, self.optimizers, self.schedulers
+                ):
+                    if update:
+                        scheduler.step = partial(scheduler_step, self=scheduler, lr_factors=new_lr_factors)
                     else:
-                        new_lrs.append(self.optim_lr)
-                if self.schedulers is None:  # learning rate completely controlled by sniper
-                    for new_lr, param_group in zip(new_lrs, optim.param_groups):
-                        param_group['lr'] = new_lr
-                else:  # learning rate controlled by scheduler; update scheduler.base_lrs
-                    scheduler = self.schedulers[i]
-                    scheduler.base_lrs = new_lrs
-                    # self.logger.info('\n'.join([f'{group["name"]} {group["lr"]}' for group in optim.param_groups]))
+                        lr_ratios = [new / old for new, old in zip(new_lr_factors, old_lr_factors)]
+                        for lr_ratio, param_group in zip(lr_ratios, optimizer.param_groups):
+                            param_group['lr'] *= lr_ratio
+            else:
+                # learning rate completely controlled by sniper
+                for old_lr_factors, new_lr_factors, optimizer in zip(
+                        self.optim_lr_factors, optim_lr_factors, self.optimizers
+                ):
+                    lr_ratios = [new / old for new, old in zip(new_lr_factors, old_lr_factors)]
+                    for lr_ratio, param_group in zip(lr_ratios, optimizer.param_groups):
+                        param_group['lr'] *= lr_ratio
+            self.optim_lr_factors = optim_lr_factors
+
+        else:  # scale_lr == True, scale_lr_by_param == False
+            lr_ratio = new_lr_factor / self.lr_factor
+            if self.schedulers:
+                for update, optimizer, scheduler in zip(self.update_step_fns, self.optimizers, self.schedulers):
+                    if update:
+                        scheduler.step = partial(scheduler_step, self=scheduler, lr_factor=lr_ratio)
+                    else:
+                        for param_group in optimizer.param_groups:
+                            param_group['lr'] *= lr_ratio
+            else:
+                for optimizer in self.optimizers:
+                    for param_group in optimizer.param_groups:
+                        param_group['lr'] *= lr_ratio
+            self.lr_factor = new_lr_factor
+        # self.logger.info('\n'.join([f'{group["name"]} {group["lr"]}' for group in optim.param_groups]))
+
+    def scaling_fn(self, sparsity_ratio):
+        return min(self.max_lr_scaling, 1.0 / (1.0 - sparsity_ratio))
 
     def reset_lrs(self):
-        if self.optimizers is not None:
-            self.logger.info('Restoring original learning rates')
-            for i, optim in enumerate(self.optimizers):
-                if self.schedulers is None:
-                    for param_group in optim.param_groups:
-                        param_group['lr'] = self.optim_lr
+        if self.schedulers:
+            for update, optimizer, scheduler, step_fn in zip(
+                    self.update_step_fns, self.optimizers, self.schedulers, self.step_fns
+            ):
+                if update:
+                    scheduler.step = step_fn
                 else:
-                    scheduler = self.schedulers[i]
-                    scheduler.base_lrs = [self.optim_lr] * len(optim.param_groups)
+                    for param_group in optimizer.param_groups:
+                        param_group['lr'] /= self.lr_factor
+        else:
+            for optim, optim_lr in zip(self.optimizers, self.optim_lrs):
+                for param_group in optim.param_groups:
+                    param_group['lr'] = optim_lr
 
     def create_masks(self, sparsity: float, total_grads: Dict[str, torch.Tensor], max_param_sparsity: float = 100.0):
         flattened_grads = torch.cat([total_grad.view(-1) for total_grad in total_grads.values()])
@@ -316,7 +406,7 @@ class SniperTraining:
                 param_threshold = torch.kthvalue(grad, 1 + int(max_sparsity * numel)).values.item()
                 mask = total_grad > param_threshold
                 nonzero = mask.sum().item()
-                if nonzero == 0:  # randomly fill the mask to max_sparsity
+                if nonzero == 0 and max_sparsity < 1.0:  # randomly fill the mask to max_sparsity
                     num_false = int(max_sparsity * numel)
                     nonzero = numel - num_false
                     bools = [False] * num_false + [True] * nonzero
@@ -383,6 +473,7 @@ class SniperTraining:
             f'Module has {nonzeros} / {numels} parameters (sparsity {sparsity:.2f}%) at epoch {self.epoch}')
 
     def restore_init(self):
+        self.logger.info('Restoring newly unmasked weights to initial values')
         init_values_path = self.sniper_dir / 'init_values.pt'
         init_values = torch.load(init_values_path, map_location=self.device)
         # The keys in init_values are fully qualified names for the whole model,
@@ -473,7 +564,8 @@ def register_backward_hooks(module_to_snip, masks, grad_scaling):
         last_module = get_module_by_name(module_to_snip, m)
         param = getattr(last_module, n)
         backward_hook = param.register_hook(
-            lambda grad, grad_mask=mask, scaling=grad_scaling: grad.mul_(grad_mask).mul_(scaling))
+            lambda grad, grad_mask=mask, scaling=grad_scaling: grad.mul_(grad_mask).mul_(scaling)
+        )
         backward_hooks.append(backward_hook)
     return backward_hooks
 
@@ -541,6 +633,27 @@ def get_param_by_name(module, full_name) -> torch.Tensor:
         return None
 
 
+def global_prune(params: Iterable[torch.Tensor], prune_ratio: float):
+    flattened = torch.cat([param.view(-1) for param in params])
+    threshold = torch.kthvalue(flattened, int(prune_ratio * len(flattened))).values.item()
+    for param in params:
+        mask = param.data >= threshold
+        param.data *= mask
+
+
+def print_nonzeros(model):
+    total_nonzeros = 0
+    total_numels = 0
+    for name, param in model.named_parameters():
+        nonzeros = torch.count_nonzero(param).item()
+        numels = param.numel()
+        sparsity = 100.0 * (1 - nonzeros / numels)
+        print(f'{name} has {nonzeros} / {numels} parameters (sparsity {sparsity:.2f}%)')
+        total_nonzeros += nonzeros
+        total_numels += numels
+    total_sparsity = 100.0 * (1 - total_nonzeros / total_numels)
+    print(f'Module has {total_nonzeros} / {total_numels} parameters (sparsity {total_sparsity:.2f}%)')
+
 def to_device(data, device=None, dtype=None, non_blocking=False, copy=False):
     """Change the device of object recursively. Copied from espnet/espnet2/torch_utils/device_funcs.py"""
     if isinstance(data, dict):
@@ -566,3 +679,101 @@ def to_device(data, device=None, dtype=None, non_blocking=False, copy=False):
         return data.to(device, dtype, non_blocking, copy)
     else:
         return data
+
+
+# Below copied from torch.optim.lr_scheduler
+
+EPOCH_DEPRECATION_WARNING = (
+    "The epoch parameter in `scheduler.step()` was not necessary and is being "
+    "deprecated where possible. Please use `scheduler.step()` to step the "
+    "scheduler. During the deprecation, if epoch is different from None, the "
+    "closed form is used instead of the new chainable form, where available. "
+    "Please open an issue if you are unable to replicate your use case: "
+    "https://github.com/pytorch/pytorch/issues/new/choose."
+)
+
+
+class _enable_get_lr_call:
+
+    def __init__(self, o):
+        self.o = o
+
+    def __enter__(self):
+        self.o._get_lr_called_within_step = True
+        return self
+
+    def __exit__(self, type, value, traceback):
+        self.o._get_lr_called_within_step = False
+
+
+def scheduler_step(self, epoch=None, lr_factor=None, lr_factors=None):
+
+    # Raise a warning if old pattern is detected
+    # https://github.com/pytorch/pytorch/issues/20124
+    if self._step_count == 1:
+        if not hasattr(self.optimizer.step, "_with_counter"):
+            warnings.warn("Seems like `optimizer.step()` has been overridden after learning rate scheduler "
+                          "initialization. Please, make sure to call `optimizer.step()` before "
+                          "`lr_scheduler.step()`. See more details at "
+                          "https://pytorch.org/docs/stable/optim.html#how-to-adjust-learning-rate", UserWarning)
+
+        # Just check if there were two first lr_scheduler.step() calls before optimizer.step()
+        elif self.optimizer._step_count < 1:
+            warnings.warn("Detected call of `lr_scheduler.step()` before `optimizer.step()`. "
+                          "In PyTorch 1.1.0 and later, you should call them in the opposite order: "
+                          "`optimizer.step()` before `lr_scheduler.step()`.  Failure to do this "
+                          "will result in PyTorch skipping the first value of the learning rate schedule. "
+                          "See more details at "
+                          "https://pytorch.org/docs/stable/optim.html#how-to-adjust-learning-rate", UserWarning)
+    self._step_count += 1
+
+    with _enable_get_lr_call(self):
+        if epoch is None:
+            self.last_epoch += 1
+            values = self.get_lr()
+        else:
+            warnings.warn(EPOCH_DEPRECATION_WARNING, UserWarning)
+            self.last_epoch = epoch
+            if hasattr(self, "_get_closed_form_lr"):
+                values = self._get_closed_form_lr()
+            else:
+                values = self.get_lr()
+
+    if lr_factor is not None:
+        values = [lr_factor * value for value in values]
+    elif lr_factors is not None:
+        values = [factor * value for factor, value in zip(lr_factors, values)]
+
+    for i, data in enumerate(zip(self.optimizer.param_groups, values)):
+        param_group, lr = data
+        param_group['lr'] = lr
+        self.print_lr(self.verbose, i, lr, epoch)
+
+    self._last_lr = [group['lr'] for group in self.optimizer.param_groups]
+
+
+def rlop_scheduler_step(self, metrics, epoch=None, lr_factor=None, lr_factors=None):
+    # convert `metrics` to float, in case it's a zero-dim Tensor
+    current = float(metrics)
+    if epoch is None:
+        epoch = self.last_epoch + 1
+    else:
+        warnings.warn(EPOCH_DEPRECATION_WARNING, UserWarning)
+    self.last_epoch = epoch
+
+    if self.is_better(current, self.best):
+        self.best = current
+        self.num_bad_epochs = 0
+    else:
+        self.num_bad_epochs += 1
+
+    if self.in_cooldown:
+        self.cooldown_counter -= 1
+        self.num_bad_epochs = 0  # ignore any bad epochs in cooldown
+
+    if self.num_bad_epochs > self.patience:
+        self._reduce_lr(epoch)
+        self.cooldown_counter = self.cooldown
+        self.num_bad_epochs = 0
+
+    self._last_lr = [group['lr'] for group in self.optimizer.param_groups]
