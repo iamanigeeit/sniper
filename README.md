@@ -6,4 +6,4 @@ Please refer to the [example notebook](example.ipynb) for usage on image classif
 
 <img src="final_graph.png">
 
-I used ESPnet for our speech experiments reported in the paper, but I did not want to upload the entire ESPnet here.  
+I used [ESPnet](https://github.com/espnet/espnet) for our speech experiments reported in the paper, but I did not want to upload the entire ESPnet here.  
